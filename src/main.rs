@@ -128,76 +128,72 @@ fn service(
             .unwrap()
     }
 
-    let state = state.clone();
-    let f = move |request: http::Request<hyper::body::Incoming>| {
-        let state = state.clone();
-        async move {
-            if request.method() == http::Method::CONNECT {
-                let (Some(host), Some(port)) = (request.uri().host(), request.uri().port_u16())
-                else {
-                    return status(http::StatusCode::BAD_REQUEST);
-                };
-                if !state.allow.is_match(&format!("{host}:{port}")) {
-                    return status(http::StatusCode::FORBIDDEN);
-                }
-                match tokio::net::TcpStream::connect((host, port)).await {
-                    Ok(mut stream) => {
-                        tokio::spawn(
-                            async move {
-                                match hyper::upgrade::on(request).await {
-                                    Ok(upgraded) => {
-                                        let mut upgraded = hyper_util::rt::TokioIo::new(upgraded);
-                                        match tokio::io::copy_bidirectional(
-                                            &mut upgraded,
-                                            &mut stream,
-                                        )
+    async fn handler(
+        state: Arc<State>,
+        request: http::Request<hyper::body::Incoming>,
+    ) -> http::Response<http_body_util::combinators::UnsyncBoxBody<Bytes, hyper::Error>> {
+        if request.method() == http::Method::CONNECT {
+            let (Some(host), Some(port)) = (request.uri().host(), request.uri().port_u16()) else {
+                return status(http::StatusCode::BAD_REQUEST);
+            };
+            if !state.allow.is_match(&format!("{host}:{port}")) {
+                return status(http::StatusCode::FORBIDDEN);
+            }
+            match tokio::net::TcpStream::connect((host, port)).await {
+                Ok(mut stream) => {
+                    tokio::spawn(
+                        async move {
+                            match hyper::upgrade::on(request).await {
+                                Ok(upgraded) => {
+                                    let mut upgraded = hyper_util::rt::TokioIo::new(upgraded);
+                                    match tokio::io::copy_bidirectional(&mut upgraded, &mut stream)
                                         .await
-                                        {
-                                            Ok((tx, rx)) => tracing::info!(tx, rx),
-                                            Err(e) => {
-                                                tracing::error!(error = e.to_string())
-                                            }
+                                    {
+                                        Ok((tx, rx)) => tracing::info!(tx, rx),
+                                        Err(e) => {
+                                            tracing::error!(error = e.to_string())
                                         }
                                     }
-                                    Err(e) => tracing::error!(error = e.to_string()),
                                 }
+                                Err(e) => tracing::error!(error = e.to_string()),
                             }
-                            .instrument(tracing::Span::current()),
-                        );
-                        status(http::StatusCode::OK)
-                    }
-                    Err(e) => {
-                        tracing::error!(error = e.to_string());
-                        status(http::StatusCode::BAD_GATEWAY)
-                    }
+                        }
+                        .instrument(tracing::Span::current()),
+                    );
+                    status(http::StatusCode::OK)
                 }
-            } else {
-                let Some(host) = request.uri().host() else {
-                    return status(http::StatusCode::BAD_REQUEST);
-                };
-                let port = match (request.uri().scheme(), request.uri().port_u16()) {
-                    (_, Some(port)) => port,
-                    (Some(scheme), _) if *scheme == http::uri::Scheme::HTTP => 80,
-                    (Some(scheme), _) if *scheme == http::uri::Scheme::HTTPS => 443,
-                    (Some(_), _) => return status(http::StatusCode::BAD_REQUEST),
-                    _ => 80,
-                };
-                if !state.allow.is_match(&format!("{host}:{port}")) {
-                    return status(http::StatusCode::FORBIDDEN);
+                Err(e) => {
+                    tracing::error!(error = e.to_string());
+                    status(http::StatusCode::BAD_GATEWAY)
                 }
-                match state.client.request(request).await {
-                    Ok(response) => response.map(http_body_util::BodyExt::boxed_unsync),
-                    Err(e) => {
-                        tracing::error!(error = e.to_string());
-                        status(http::StatusCode::BAD_GATEWAY)
-                    }
+            }
+        } else {
+            let Some(host) = request.uri().host() else {
+                return status(http::StatusCode::BAD_REQUEST);
+            };
+            let port = match (request.uri().scheme(), request.uri().port_u16()) {
+                (_, Some(port)) => port,
+                (Some(scheme), _) if *scheme == http::uri::Scheme::HTTP => 80,
+                (Some(scheme), _) if *scheme == http::uri::Scheme::HTTPS => 443,
+                (Some(_), _) => return status(http::StatusCode::BAD_REQUEST),
+                _ => 80,
+            };
+            if !state.allow.is_match(&format!("{host}:{port}")) {
+                return status(http::StatusCode::FORBIDDEN);
+            }
+            match state.client.request(request).await {
+                Ok(response) => response.map(http_body_util::BodyExt::boxed_unsync),
+                Err(e) => {
+                    tracing::error!(error = e.to_string());
+                    status(http::StatusCode::BAD_GATEWAY)
                 }
             }
         }
-        .map(Ok)
-    };
+    }
+
+    let state = state.clone();
     let service = tower::ServiceBuilder::new()
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .service_fn(f);
+        .service_fn(move |request| handler(state.clone(), request).map(Ok));
     hyper_util::service::TowerToHyperService::new(service)
 }
