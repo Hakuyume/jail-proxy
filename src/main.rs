@@ -5,13 +5,16 @@ use futures::{FutureExt, TryFutureExt, TryStreamExt};
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::Instrument;
 
 #[derive(Parser)]
 struct Args {
     #[clap(long)]
-    bind: Vec<SocketAddr>,
+    bind_addr: Vec<SocketAddr>,
+    #[clap(long)]
+    bind_path: Vec<PathBuf>,
     #[clap(long)]
     allow: Vec<regex::Regex>,
 }
@@ -33,11 +36,14 @@ async fn main() -> io::Result<()> {
     let service = hyper_util::service::TowerToHyperService::new(service);
 
     let mut listeners = futures::future::try_join_all(
-        args.bind
+        args.bind_addr
             .into_iter()
             .map(|bind| tokio::net::TcpListener::bind(bind).map_ok(Tcp)),
     )
     .await?;
+    for bind in args.bind_path {
+        listeners.push(Unix(tokio::net::UnixListener::bind(bind)?));
+    }
     let mut listenfd = listenfd::ListenFd::from_env();
     for i in 0..listenfd.len() {
         if let Ok(Some(listener)) = listenfd.take_tcp_listener(i) {
