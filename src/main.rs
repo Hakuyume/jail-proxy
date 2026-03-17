@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use clap::Parser;
-use futures::future::Either::{Left as Tcp, Right as Unix};
-use futures::{FutureExt, TryFutureExt, TryStreamExt};
+use futures::{FutureExt, TryStreamExt};
 use std::convert::Infallible;
 use std::io;
 use std::net::SocketAddr;
@@ -35,62 +34,37 @@ async fn main() -> io::Result<()> {
         .service_fn(move |request| handler(state.clone(), request).map(Ok::<_, Infallible>));
     let service = hyper_util::service::TowerToHyperService::new(service);
 
-    let mut listeners = futures::future::try_join_all(
+    let mut listener = tokio_net_incoming::bind(
         args.bind_addr
             .into_iter()
-            .map(|bind| tokio::net::TcpListener::bind(bind).map_ok(Tcp)),
+            .map(tokio_net_incoming::OneOf::Tcp)
+            .chain(
+                args.bind_path
+                    .into_iter()
+                    .map(tokio_net_incoming::OneOf::Unix),
+            ),
     )
     .await?;
-    for bind in args.bind_path {
-        listeners.push(Unix(tokio::net::UnixListener::bind(bind)?));
-    }
-    let mut listenfd = listenfd::ListenFd::from_env();
-    for i in 0..listenfd.len() {
-        if let Ok(Some(listener)) = listenfd.take_tcp_listener(i) {
-            listener.set_nonblocking(true)?;
-            listeners.push(Tcp(tokio::net::TcpListener::from_std(listener)?));
-        } else if let Ok(Some(listener)) = listenfd.take_unix_listener(i) {
-            listener.set_nonblocking(true)?;
-            listeners.push(Unix(tokio::net::UnixListener::from_std(listener)?));
-        }
+    listener.extend(tokio_net_incoming::listenfd_1(
+        listenfd::ListenFd::from_env(),
+    )?);
+    for listener in &listener {
+        tracing::info!(bind = ?listener.local_addr());
     }
 
-    let mut stream =
-        futures::stream::select_all(listeners.into_iter().map(|listener| match listener {
-            Tcp(listener) => {
-                tracing::info!(bind = ?listener.local_addr());
-                Tcp(tokio_stream::wrappers::TcpListenerStream::new(listener).map_ok(Tcp))
-            }
-            Unix(listener) => {
-                tracing::info!(bind = ?listener.local_addr());
-                Unix(tokio_stream::wrappers::UnixListenerStream::new(listener).map_ok(Unix))
-            }
-        }));
-    while let Some(item) = stream.try_next().await? {
-        match item {
-            Tcp(stream) => {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let service = service.clone();
-                tokio::spawn(async move {
-                    hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(io, service)
-                    .await
-                });
-            }
-            Unix(stream) => {
-                let io = hyper_util::rt::TokioIo::new(stream);
-                let service = service.clone();
-                tokio::spawn(async move {
-                    hyper_util::server::conn::auto::Builder::new(
-                        hyper_util::rt::TokioExecutor::new(),
-                    )
-                    .serve_connection_with_upgrades(io, service)
-                    .await
-                });
-            }
-        }
+    let mut listener_stream = futures::stream::select_all(
+        listener
+            .into_iter()
+            .map(tokio_net_incoming::ListenerStream::new),
+    );
+    while let Some(stream) = listener_stream.try_next().await? {
+        let io = hyper_util::rt::TokioIo::new(stream);
+        let service = service.clone();
+        tokio::spawn(async move {
+            hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                .serve_connection_with_upgrades(io, service)
+                .await
+        });
     }
 
     Ok(())
