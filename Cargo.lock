@@ -654,7 +654,7 @@ dependencies = [
 [[package]]
 name = "tokio-net-incoming"
 version = "0.1.0"
-source = "git+https://github.com/Hakuyume/tokio-net-incoming.git#6c8269c909c2eafdcbbb694db7f84678a80f6d92"
+source = "git+https://github.com/Hakuyume/tokio-net-incoming.git#2289a269943d1d155769f6a2a0f24af6a9cc5d5d"
 dependencies = [
  "futures",
  "listenfd",

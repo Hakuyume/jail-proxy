@@ -34,7 +34,7 @@ async fn main() -> io::Result<()> {
         .service_fn(move |request| handler(state.clone(), request).map(Ok::<_, Infallible>));
     let service = hyper_util::service::TowerToHyperService::new(service);
 
-    let mut listener = tokio_net_incoming::bind(
+    let mut listeners = futures::future::try_join_all(
         args.bind_addr
             .into_iter()
             .map(tokio_net_incoming::OneOf::Tcp)
@@ -42,22 +42,23 @@ async fn main() -> io::Result<()> {
                 args.bind_path
                     .into_iter()
                     .map(tokio_net_incoming::OneOf::Unix),
-            ),
+            )
+            .map(tokio_net_incoming::Listener::bind),
     )
     .await?;
-    listener.extend(tokio_net_incoming::listenfd_1(
-        listenfd::ListenFd::from_env(),
-    )?);
-    for listener in &listener {
+    for listener in tokio_net_incoming::listenfd_1(listenfd::ListenFd::from_env()) {
+        listeners.push(listener?);
+    }
+    for listener in &listeners {
         tracing::info!(bind = ?listener.local_addr());
     }
-
-    let mut listener_stream = futures::stream::select_all(
-        listener
+    let mut incoming = futures::stream::select_all(
+        listeners
             .into_iter()
             .map(tokio_net_incoming::ListenerStream::new),
     );
-    while let Some(stream) = listener_stream.try_next().await? {
+
+    while let Some(stream) = incoming.try_next().await? {
         let io = hyper_util::rt::TokioIo::new(stream);
         let service = service.clone();
         tokio::spawn(async move {
