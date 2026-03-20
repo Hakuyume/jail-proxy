@@ -11,9 +11,9 @@ use tracing::Instrument;
 #[derive(Parser)]
 struct Args {
     #[clap(long)]
-    bind_addr: Vec<SocketAddr>,
+    bind_tcp: Vec<SocketAddr>,
     #[clap(long)]
-    bind_path: Vec<PathBuf>,
+    bind_unix: Vec<PathBuf>,
     #[clap(long)]
     allow: Vec<regex::Regex>,
 }
@@ -35,11 +35,11 @@ async fn main() -> io::Result<()> {
     let service = hyper_util::service::TowerToHyperService::new(service);
 
     let mut listeners = futures::future::try_join_all(
-        args.bind_addr
+        args.bind_tcp
             .into_iter()
             .map(tokio_net_incoming::OneOf::Tcp)
             .chain(
-                args.bind_path
+                args.bind_unix
                     .into_iter()
                     .map(tokio_net_incoming::OneOf::Unix),
             )
@@ -49,12 +49,10 @@ async fn main() -> io::Result<()> {
     for listener in tokio_net_incoming::listenfd_1(listenfd::ListenFd::from_env()) {
         listeners.push(listener?);
     }
-    for listener in &listeners {
-        tracing::info!(bind = ?listener.local_addr());
-    }
     let mut incoming = futures::stream::select_all(
         listeners
             .into_iter()
+            .inspect(|listener| tracing::info!(bind = ?listener.local_addr()))
             .map(tokio_net_incoming::ListenerStream::new),
     );
 
